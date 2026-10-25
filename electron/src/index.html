@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* https://*; media-src 'self' blob: mediastream:;" />
+  <title>Speich AI</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="authScreen" class="screen">
+    <div class="card auth-card">
+      <h1>Speich AI</h1>
+      <p class="sub">Live voice conversion for calls & streaming</p>
+      <div class="tabs">
+        <button type="button" class="tab active" data-mode="login">Login</button>
+        <button type="button" class="tab" data-mode="register">Register</button>
+      </div>
+      <form id="authForm">
+        <input id="authName" class="hidden" type="text" placeholder="Name (optional)" autocomplete="name" />
+        <input id="authEmail" type="email" placeholder="Email" required autocomplete="username" />
+        <input id="authPassword" type="password" placeholder="Password" required autocomplete="current-password" />
+        <button type="submit" class="btn primary" id="authSubmit">Login</button>
+      </form>
+      <p id="authError" class="error"></p>
+    </div>
+  </div>
+
+  <div id="appScreen" class="screen hidden">
+    <header class="top">
+      <div class="brand">Speich AI</div>
+      <div class="top-right">
+        <span id="balanceLabel" class="balance">—</span>
+        <button type="button" class="btn ghost" id="refreshBalBtn">Refresh</button>
+        <button type="button" class="btn ghost" id="logoutBtn">Logout</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel">
+        <h2>Voice</h2>
+        <select id="voiceSelect"></select>
+        <p class="hint">Voices load from your ElevenLabs account via the server.</p>
+
+        <h2>Session</h2>
+        <div class="row">
+          <button type="button" class="btn primary" id="startBtn">Start</button>
+          <button type="button" class="btn danger" id="stopBtn" disabled>Stop</button>
+        </div>
+        <p id="statusText" class="status">Idle</p>
+        <div class="meter"><div id="levelBar" class="level"></div></div>
+      </section>
+
+      <section class="panel">
+        <h2>How it works</h2>
+        <ol class="steps">
+          <li>Pick a voice</li>
+          <li>Click Start and speak</li>
+          <li>Converted audio plays here (route to Discord/Zoom with a virtual cable later)</li>
+        </ol>
+        <p class="hint">Balance is deducted per second of conversion. Buy minutes from the web/admin flow (Morphly-style packs).</p>
+        <div class="api-box">
+          <label>API base</label>
+          <input id="apiBaseInput" type="url" />
+          <button type="button" class="btn" id="saveApiBtn">Save</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <audio id="playback" autoplay></audio>
+  <script src="renderer.js"></script>
+</body>
+</html>
