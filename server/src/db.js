@@ -6,9 +6,20 @@ function getPool() {
   if (!pool) {
     const url = process.env.DATABASE_URL;
     if (!url) throw new Error("DATABASE_URL is not set");
+
+    // Supabase / managed Postgres: TLS is required, but Node often hits
+    // SELF_SIGNED_CERT_IN_CHAIN with the default CA store.
+    const isLocal =
+      url.includes("localhost") ||
+      url.includes("127.0.0.1");
+
     pool = new Pool({
       connectionString: url,
-      ssl: url.includes("localhost") ? false : { rejectUnauthorized: false }
+      ssl: isLocal
+        ? false
+        : {
+            rejectUnauthorized: false
+          }
     });
   }
   return pool;

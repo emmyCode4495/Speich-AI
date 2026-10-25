@@ -2,6 +2,9 @@
  * Speich-AI renderer
  * Records short mic chunks → POST /api/sts/convert → plays result
  * Near-live STS (chunk latency ~1–2s depending on size)
+ *
+ * UI notes: the stage draws two live "ribbons" — amber is your microphone,
+ * lilac is the converted voice — driven by real Web Audio analysers.
  */
 
 let token = localStorage.getItem("speich_token") || null;
@@ -10,12 +13,30 @@ let authMode = "login";
 let mediaStream = null;
 let mediaRecorder = null;
 let isRunning = false;
+let starting = false;
 let selectedVoiceId = null;
+let voices = [];
 let audioQueue = [];
 let playing = false;
 
-const $ = (id) => document.getElementById(id);
+// audio graph
+let ac = null;
+let micAnalyser = null;
+let micSource = null;
+let outAnalyser = null;
+let levelBuf = null;
 
+// session stats
+let sessionStart = 0;
+let elapsedTimer = null;
+let inflight = 0;
+
+const $ = (id) => document.getElementById(id);
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+/* ============================================================
+   API
+   ============================================================ */
 async function apiBase() {
   const fromStore = (await window.speich.getApiBase()) || "http://localhost:3850";
   return String(fromStore).replace(/\/$/, "");
@@ -39,46 +60,276 @@ async function api(path, opts = {}) {
   return data;
 }
 
-function showAuth() {
-  $("authScreen").classList.remove("hidden");
-  $("appScreen").classList.add("hidden");
+/* ============================================================
+   Ribbons — the live waveform
+   ============================================================ */
+function createRibbons(canvas, { levels, ambient = 0.08 }) {
+  const ctx = canvas.getContext("2d");
+  const cs = getComputedStyle(document.documentElement);
+  const COLOR = { you: cs.getPropertyValue("--you").trim(), voice: cs.getPropertyValue("--voice").trim() };
+  let w = 0, h = 0, raf = 0, running = false, you = 0, voice = 0;
+  const t0 = performance.now();
+
+  const ro = new ResizeObserver(() => {
+    const r = canvas.getBoundingClientRect();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    w = r.width;
+    h = r.height;
+    canvas.width = Math.max(1, Math.round(w * dpr));
+    canvas.height = Math.max(1, Math.round(h * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (!running) frame(performance.now());
+  });
+  ro.observe(canvas);
+
+  // fast attack, slow release — reads like a real meter
+  const follow = (cur, target) => cur + (target - cur) * (target > cur ? 0.35 : 0.08);
+
+  function graticule() {
+    ctx.save();
+    ctx.strokeStyle = "rgba(236,234,246,0.07)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= w; x += 48) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, h); }
+    ctx.stroke();
+    ctx.setLineDash([4, 6]);
+    ctx.strokeStyle = "rgba(236,234,246,0.14)";
+    ctx.beginPath();
+    ctx.moveTo(0, Math.round(h / 2) + 0.5);
+    ctx.lineTo(w, Math.round(h / 2) + 0.5);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function ribbon(t, amp, color, phase, speed, lw, alpha, dy) {
+    ctx.beginPath();
+    for (let x = 0; x <= w; x += 4) {
+      const u = x / w;
+      const env = Math.pow(Math.sin(Math.PI * u), 1.4);
+      const y =
+        h / 2 + dy +
+        env * amp * (Math.sin(u * 9 + t * speed + phase) * 0.65 + Math.sin(u * 17 - t * speed * 1.3 + phase * 2) * 0.35);
+      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = lw;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.stroke();
+  }
+
+  function frame(now) {
+    if (!w || !h) { if (running) raf = requestAnimationFrame(frame); return; }
+    const t = reduceMotion.matches ? 0 : (now - t0) / 1000;
+    const L = levels(t);
+    you = follow(you, L.you);
+    voice = follow(voice, L.voice);
+
+    ctx.clearRect(0, 0, w, h);
+    graticule();
+
+    const maxA = h * 0.4;
+    const idle = ambient * (0.75 + 0.25 * Math.sin(t * 0.7));
+    const aYou = maxA * (idle + you * 0.9);
+    const aVoice = maxA * (idle * 0.9 + voice * 0.9);
+
+    ctx.globalCompositeOperation = "lighter";
+    ctx.shadowBlur = 14;
+    ctx.shadowColor = COLOR.voice;
+    ribbon(t, aVoice, COLOR.voice, 1.6, 0.9, 2.6, 0.95, 3);
+    ctx.shadowBlur = 0;
+    ribbon(t, aVoice * 0.7, COLOR.voice, 2.1, 0.7, 1.4, 0.35, 4);
+    ctx.shadowBlur = 14;
+    ctx.shadowColor = COLOR.you;
+    ribbon(t, aYou, COLOR.you, 0, 1.15, 2.2, 0.95, -3);
+    ctx.shadowBlur = 0;
+    ribbon(t, aYou * 0.7, COLOR.you, 0.7, 0.85, 1.2, 0.3, -4);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+
+    if (running) raf = requestAnimationFrame(frame);
+  }
+
+  return {
+    start() { if (running) return; running = true; raf = requestAnimationFrame(frame); },
+    stop() { running = false; cancelAnimationFrame(raf); }
+  };
 }
 
-function showApp() {
-  $("authScreen").classList.add("hidden");
-  $("appScreen").classList.remove("hidden");
+function rms(analyser) {
+  analyser.getByteTimeDomainData(levelBuf);
+  let s = 0;
+  for (let i = 0; i < levelBuf.length; i++) {
+    const v = (levelBuf[i] - 128) / 128;
+    s += v * v;
+  }
+  return Math.min(1, Math.sqrt(s / levelBuf.length) * 3.4);
 }
+
+function setNode(id, on) {
+  const el = $(id);
+  if (el._on !== on) { el._on = on; el.classList.toggle("on", on); }
+}
+
+const authRibbons = createRibbons($("authCanvas"), {
+  ambient: 0.2,
+  levels: () => {
+    const n = performance.now();
+    return { you: 0.16 + 0.12 * Math.sin(n / 1300), voice: 0.18 + 0.14 * Math.sin(n / 1700 + 1.2) };
+  }
+});
+
+const stageRibbons = createRibbons($("stageCanvas"), {
+  ambient: 0.075,
+  levels: () => {
+    const you = micAnalyser ? rms(micAnalyser) : 0;
+    const voice = outAnalyser && playing ? rms(outAnalyser) : 0;
+    setNode("nodeMic", you > 0.08);
+    setNode("nodeConv", inflight > 0);
+    setNode("nodeOut", playing && voice > 0.04);
+    return { you, voice };
+  }
+});
+
+/* ============================================================
+   Screens
+   ============================================================ */
+function swapScreens(toApp, animate = true) {
+  const apply = () => {
+    $("authScreen").classList.toggle("hidden", toApp);
+    $("appScreen").classList.toggle("hidden", !toApp);
+    if (toApp) { authRibbons.stop(); stageRibbons.start(); }
+    else { stageRibbons.stop(); authRibbons.start(); }
+  };
+  if (animate && document.startViewTransition && !reduceMotion.matches) {
+    document.startViewTransition(apply);
+  } else {
+    apply();
+  }
+}
+const showAuth = (animate) => swapScreens(false, animate);
+const showApp = (animate) => swapScreens(true, animate);
+
+/* ============================================================
+   Small UI helpers
+   ============================================================ */
+function toast(msg, kind = "info") {
+  const el = document.createElement("div");
+  el.className = `toast ${kind === "error" ? "error" : ""}`;
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  const life = kind === "error" ? 5000 : 3000;
+  setTimeout(() => {
+    el.classList.add("out");
+    el.addEventListener("animationend", () => el.remove(), { once: true });
+    setTimeout(() => el.remove(), 400);
+  }, life);
+  while ($("toasts").children.length > 3) $("toasts").firstChild.remove();
+}
+
+function setStatus(text, state) {
+  const el = $("statusText");
+  if (state) $("statusChip").dataset.state = state;
+  if (el.textContent !== text) {
+    el.textContent = text;
+    el.classList.remove("flash");
+    void el.offsetWidth;
+    el.classList.add("flash");
+  }
+}
+
+function fmtClock(sec) {
+  const m = Math.floor(sec / 60);
+  return `${m}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+}
+
+/* ---------- Balance (animated count) ---------- */
+let balShown = null;
+let balRaf = 0;
 
 function formatBalance(sec) {
   const s = Math.max(0, Math.floor(sec || 0));
   const m = Math.floor(s / 60);
   const r = s % 60;
-  return `${m}m ${String(r).padStart(2, "0")}s left`;
+  return `${m}m ${String(r).padStart(2, "0")}s`;
+}
+
+function paintBalance(sec) {
+  $("balanceLabel").textContent = formatBalance(sec);
 }
 
 function setBalance(sec) {
   if (currentUser) currentUser.balanceSeconds = sec;
-  $("balanceLabel").textContent = formatBalance(sec);
+  const to = Math.max(0, Math.floor(sec || 0));
+  $("balancePill").dataset.tone = to < 60 ? "critical" : to < 300 ? "low" : "ok";
+  $("balancePill").setAttribute("aria-label", `Balance: ${formatBalance(to)} left`);
+
+  cancelAnimationFrame(balRaf);
+  if (balShown === null || reduceMotion.matches || Math.abs(to - balShown) < 1) {
+    balShown = to;
+    paintBalance(to);
+    return;
+  }
+  const from = balShown;
+  const start = performance.now();
+  const dur = 650;
+  const step = (now) => {
+    const p = Math.min(1, (now - start) / dur);
+    const e = 1 - Math.pow(1 - p, 3);
+    balShown = Math.round(from + (to - from) * e);
+    paintBalance(balShown);
+    if (p < 1) balRaf = requestAnimationFrame(step);
+  };
+  balRaf = requestAnimationFrame(step);
 }
 
-function setStatus(t) {
-  $("statusText").textContent = t;
-}
-
-// Auth UI
-document.querySelectorAll(".tab").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    authMode = btn.dataset.mode;
-    $("authSubmit").textContent = authMode === "login" ? "Login" : "Create account";
-    $("authName").classList.toggle("hidden", authMode === "login");
+/* ============================================================
+   Auth UI
+   ============================================================ */
+function setAuthMode(mode) {
+  authMode = mode;
+  const reg = mode === "register";
+  $("authSeg").dataset.mode = mode;
+  document.querySelectorAll(".tab").forEach((b) => {
+    const on = b.dataset.mode === mode;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", String(on));
   });
+  $("authSubmitLabel").textContent = reg ? "Create account" : "Log in";
+  $("authHeading").textContent = reg ? "Create your account" : "Welcome back";
+  $("authSub").textContent = reg ? "Set up in a minute, then pick a voice." : "Log in to pick up where you left off.";
+  $("nameWrap").classList.toggle("open", reg);
+  $("nameWrap").inert = !reg;
+  $("authPassword").autocomplete = reg ? "new-password" : "current-password";
+  clearAuthError();
+}
+document.querySelectorAll(".tab").forEach((btn) => btn.addEventListener("click", () => setAuthMode(btn.dataset.mode)));
+$("nameWrap").inert = true;
+
+function showAuthError(msg) {
+  const el = $("authError");
+  el.textContent = msg;
+  el.classList.add("show");
+}
+function clearAuthError() {
+  $("authError").classList.remove("show");
+}
+
+$("pwToggle").addEventListener("click", () => {
+  const input = $("authPassword");
+  const show = input.type === "password";
+  input.type = show ? "text" : "password";
+  $("pwToggle").setAttribute("aria-pressed", String(show));
+  $("pwToggle").setAttribute("aria-label", show ? "Hide password" : "Show password");
 });
 
 $("authForm").addEventListener("submit", async (e) => {
   e.preventDefault();
-  $("authError").textContent = "";
+  clearAuthError();
+  const btn = $("authSubmit");
+  btn.disabled = true;
+  btn.classList.add("loading");
   try {
     const body = {
       email: $("authEmail").value.trim(),
@@ -92,7 +343,10 @@ $("authForm").addEventListener("submit", async (e) => {
     currentUser = data.user;
     await enterApp();
   } catch (err) {
-    $("authError").textContent = err.message || "Auth failed";
+    showAuthError(err.message || "Could not sign in. Check your details and server address.");
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("loading");
   }
 });
 
@@ -100,112 +354,257 @@ $("logoutBtn").addEventListener("click", () => {
   stopSession();
   token = null;
   currentUser = null;
+  balShown = null;
   localStorage.removeItem("speich_token");
+  $("authPassword").value = "";
   showAuth();
 });
 
 $("refreshBalBtn").addEventListener("click", async () => {
+  const btn = $("refreshBalBtn");
+  btn.classList.remove("spin");
+  void btn.offsetWidth;
+  btn.classList.add("spin");
   try {
     const data = await api("/api/me");
     currentUser = data.user;
     setBalance(data.user.balanceSeconds);
   } catch (err) {
-    setStatus(err.message);
+    toast(err.message || "Could not refresh balance", "error");
   }
 });
 
-$("saveApiBtn").addEventListener("click", async () => {
+/* ---------- Settings dialog ---------- */
+async function openSettings() {
+  $("apiBaseInput").value = await apiBase();
+  $("settingsDialog").showModal();
+}
+$("settingsBtn").addEventListener("click", openSettings);
+$("authServerBtn").addEventListener("click", openSettings);
+$("cancelApiBtn").addEventListener("click", () => $("settingsDialog").close());
+$("settingsDialog").addEventListener("click", (e) => {
+  if (e.target === $("settingsDialog")) $("settingsDialog").close(); // click on backdrop
+});
+$("settingsForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
   const v = $("apiBaseInput").value.trim().replace(/\/$/, "");
+  if (!v) return;
   await window.speich.setSetting("apiBaseUrl", v);
-  setStatus("API base saved");
+  $("settingsDialog").close();
+  toast("Server address saved");
 });
 
-async function enterApp() {
-  showApp();
-  setBalance(currentUser.balanceSeconds);
-  const settings = await window.speich.getSettings();
-  $("apiBaseInput").value = settings.apiBaseUrl || "http://localhost:3850";
-  await loadVoices();
+/* ============================================================
+   Voices
+   ============================================================ */
+function escapeText(s) { return String(s == null ? "" : s); }
+
+function hueFor(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) % 360;
+  return h;
 }
+
+function voiceSub(v) {
+  const l = v.labels || {};
+  const bits = [l.gender, l.accent, l.age].filter(Boolean);
+  return bits.length ? bits.join(", ") : v.category || "";
+}
+
+function renderVoices() {
+  const box = $("voiceItems");
+  box.textContent = "";
+  voices.forEach((v) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "voice";
+    row.setAttribute("role", "radio");
+    row.dataset.id = v.voiceId;
+    row.dataset.name = (v.name || "").toLowerCase();
+    row.style.setProperty("--h", hueFor(v.name || v.voiceId));
+
+    const mono = document.createElement("span");
+    mono.className = "mono";
+    mono.textContent = (v.name || "?").trim().charAt(0).toUpperCase();
+
+    const text = document.createElement("span");
+    text.className = "v-text";
+    const name = document.createElement("span");
+    name.className = "v-name";
+    name.textContent = escapeText(v.name);
+    const sub = document.createElement("span");
+    sub.className = "v-sub";
+    sub.textContent = voiceSub(v);
+    text.append(name, sub);
+
+    row.append(mono, text);
+    row.addEventListener("click", () => selectVoice(v.voiceId, { focus: false }));
+    box.appendChild(row);
+  });
+
+  $("voiceCount").textContent = voices.length ? String(voices.length) : "";
+  $("voiceSearchWrap").classList.toggle("off", voices.length <= 8);
+  const empty = document.createElement("p");
+  empty.className = "voice-empty hidden";
+  empty.id = "voiceEmpty";
+  empty.textContent = "No voices match that search.";
+  box.appendChild(empty);
+  selectVoice(selectedVoiceId, { instant: true });
+}
+
+function selectVoice(id, { instant = false, focus = false } = {}) {
+  selectedVoiceId = id;
+  const v = voices.find((x) => x.voiceId === id);
+  const h2 = $("speakingAs");
+  const label = v ? v.name : "Choose a voice";
+  if (h2.textContent !== label) {
+    h2.textContent = label;
+    h2.classList.remove("swap");
+    void h2.offsetWidth;
+    if (!instant) h2.classList.add("swap");
+  }
+  document.querySelectorAll("#voiceItems .voice").forEach((r) => {
+    const on = r.dataset.id === id;
+    r.setAttribute("aria-checked", String(on));
+    r.tabIndex = on ? 0 : -1;
+    if (on && focus) r.focus();
+  });
+  placeHighlight(instant);
+}
+
+function placeHighlight(instant) {
+  const hi = $("voiceHi");
+  const row = document.querySelector(`#voiceItems .voice[aria-checked="true"]`);
+  if (!row || row.classList.contains("hide")) { hi.classList.remove("show"); return; }
+  hi.style.height = `${row.offsetHeight}px`;
+  if (instant || !hi.classList.contains("show")) hi.classList.remove("ready");
+  hi.style.transform = `translateY(${row.offsetTop}px)`;
+  hi.classList.add("show");
+  if (!hi.classList.contains("ready")) requestAnimationFrame(() => requestAnimationFrame(() => hi.classList.add("ready")));
+  if (!instant) row.scrollIntoView({ block: "nearest", behavior: reduceMotion.matches ? "auto" : "smooth" });
+}
+
+$("voiceList").addEventListener("keydown", (e) => {
+  if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+  const rows = [...document.querySelectorAll("#voiceItems .voice:not(.hide)")];
+  if (!rows.length) return;
+  e.preventDefault();
+  let i = rows.findIndex((r) => r.dataset.id === selectedVoiceId);
+  if (e.key === "Home") i = 0;
+  else if (e.key === "End") i = rows.length - 1;
+  else i = Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" || e.key === "ArrowRight" ? 1 : -1)));
+  selectVoice(rows[i].dataset.id, { focus: true });
+});
+
+$("voiceSearch").addEventListener("input", (e) => {
+  const q = e.target.value.trim().toLowerCase();
+  let shown = 0;
+  document.querySelectorAll("#voiceItems .voice").forEach((r) => {
+    const hit = !q || r.dataset.name.includes(q);
+    r.classList.toggle("hide", !hit);
+    if (hit) shown++;
+  });
+  $("voiceEmpty").classList.toggle("hidden", shown > 0);
+  placeHighlight(true);
+});
+
+window.addEventListener("resize", () => placeHighlight(true));
 
 async function loadVoices() {
-  const sel = $("voiceSelect");
-  sel.innerHTML = `<option value="">Loading…</option>`;
+  const box = $("voiceItems");
+  box.innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+  $("voiceHi").classList.remove("show");
   try {
     const data = await api("/api/voices");
-    const voices = data.voices || [];
+    voices = data.voices || [];
     if (!voices.length) {
-      sel.innerHTML = `<option value="">No voices on ElevenLabs account</option>`;
+      box.innerHTML = "";
+      const p = document.createElement("p");
+      p.className = "voice-empty";
+      p.textContent = "No voices found on your ElevenLabs account.";
+      box.appendChild(p);
+      $("voiceCount").textContent = "";
+      selectVoice(null, { instant: true });
       return;
     }
-    sel.innerHTML = voices
-      .map((v) => `<option value="${v.voiceId}">${escapeHtml(v.name)}</option>`)
-      .join("");
-    selectedVoiceId = voices[0].voiceId;
-    sel.value = selectedVoiceId;
+    if (!voices.some((v) => v.voiceId === selectedVoiceId)) selectedVoiceId = voices[0].voiceId;
+    renderVoices();
   } catch (err) {
-    sel.innerHTML = `<option value="">Failed to load voices</option>`;
-    setStatus(err.message);
+    box.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = "voice-empty";
+    p.textContent = "Could not load voices. Check your server address and try again.";
+    box.appendChild(p);
+    toast(err.message || "Failed to load voices", "error");
   }
 }
 
-$("voiceSelect").addEventListener("change", (e) => {
-  selectedVoiceId = e.target.value;
-});
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+/* ============================================================
+   Recording / convert loop
+   ============================================================ */
+function ensureAudioGraph() {
+  if (!ac) ac = new AudioContext();
+  if (ac.state === "suspended") ac.resume();
+  if (!outAnalyser) {
+    // route playback through an analyser so the Voice ribbon reacts to real output
+    const src = ac.createMediaElementSource($("playback"));
+    outAnalyser = ac.createAnalyser();
+    outAnalyser.fftSize = 1024;
+    src.connect(outAnalyser);
+    outAnalyser.connect(ac.destination);
+    levelBuf = new Uint8Array(outAnalyser.fftSize);
+  }
 }
 
-// ---------- Recording / convert loop ----------
+function setLiveButton(state) {
+  $("liveBtn").dataset.live = state; // "false" | "busy" | "true"
+  $("liveBtn").disabled = state === "busy";
+  $("appScreen").querySelector(".stage").classList.toggle("live", state === "true");
+}
+
+function micErrorMessage(err) {
+  if (err && err.name === "NotAllowedError") return "Microphone access is blocked. Allow it in your system privacy settings.";
+  if (err && err.name === "NotFoundError") return "No microphone found. Plug one in and try again.";
+  return (err && err.message) || "Could not start the session";
+}
+
 async function startSession() {
-  if (isRunning) return;
+  if (isRunning || starting) return;
   if (!selectedVoiceId) {
-    setStatus("Select a voice first");
+    toast("Choose a voice first", "error");
     return;
   }
   if ((currentUser?.balanceSeconds || 0) < 1) {
-    setStatus("Insufficient balance — buy minutes");
+    toast("Your balance is empty. Add minutes to start.", "error");
     return;
   }
+
+  starting = true;
+  setLiveButton("busy");
+  setStatus("Connecting…", "connecting");
 
   try {
     await api("/api/sts/session", {
       method: "POST",
       body: JSON.stringify({ voiceId: selectedVoiceId })
     });
+
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+    });
+
+    ensureAudioGraph();
+    micSource = ac.createMediaStreamSource(mediaStream);
+    micAnalyser = ac.createAnalyser();
+    micAnalyser.fftSize = 1024;
+    micSource.connect(micAnalyser);
   } catch (err) {
-    setStatus(err.message);
+    if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+    starting = false;
+    setLiveButton("false");
+    setStatus("Ready", "idle");
+    toast(err.status === 402 ? err.message : micErrorMessage(err), "error");
     return;
-  }
-
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      channelCount: 1
-    }
-  });
-
-  // Level meter
-  const ctx = new AudioContext();
-  const src = ctx.createMediaStreamSource(mediaStream);
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 256;
-  src.connect(analyser);
-  const dataArr = new Uint8Array(analyser.frequencyBinCount);
-  function tickLevel() {
-    if (!isRunning) return;
-    analyser.getByteFrequencyData(dataArr);
-    let sum = 0;
-    for (let i = 0; i < dataArr.length; i++) sum += dataArr[i];
-    const pct = Math.min(100, (sum / dataArr.length / 128) * 100);
-    $("levelBar").style.width = `${pct}%`;
-    requestAnimationFrame(tickLevel);
   }
 
   const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -218,6 +617,8 @@ async function startSession() {
     const blob = ev.data;
     // ~chunk duration estimate from timeslice
     const durationSeconds = 1.2;
+    const sentAt = performance.now();
+    inflight++;
     try {
       const ab = await blob.arrayBuffer();
       const b64 = arrayBufferToBase64(ab);
@@ -231,49 +632,62 @@ async function startSession() {
           filename: "chunk.webm"
         })
       });
+      $("latency").textContent = `${((performance.now() - sentAt) / 1000).toFixed(1)}s`;
       setBalance(result.balanceSeconds);
       if (result.balanceSeconds < 1) {
-        setStatus("Balance empty — stopped");
-        stopSession();
+        setStatus("Stopped, balance empty", "stopped");
+        toast("Your balance ran out. Add minutes to continue.", "error");
+        stopSession(true);
         return;
       }
       enqueuePlayback(result.audioBase64, result.contentType || "audio/mpeg");
-      setStatus("Live · converting…");
+      setStatus("Live, converting", "converting");
     } catch (err) {
       if (err.status === 402) {
-        setStatus("Insufficient balance");
-        stopSession();
+        setStatus("Stopped, balance empty", "stopped");
+        toast("Your balance ran out. Add minutes to continue.", "error");
+        stopSession(true);
       } else {
         console.error(err);
-        setStatus(err.message || "Convert error");
+        setStatus("Conversion error", "error");
+        toast(err.message || "Conversion failed", "error");
       }
+    } finally {
+      inflight = Math.max(0, inflight - 1);
     }
   };
 
   isRunning = true;
-  $("startBtn").disabled = true;
-  $("stopBtn").disabled = false;
-  setStatus("Listening…");
+  starting = false;
+  setLiveButton("true");
+  setStatus("Listening", "listening");
+  $("latency").textContent = "–";
+  sessionStart = performance.now();
+  $("elapsed").textContent = "0:00";
+  clearInterval(elapsedTimer);
+  elapsedTimer = setInterval(() => {
+    $("elapsed").textContent = fmtClock((performance.now() - sessionStart) / 1000);
+  }, 250);
   mediaRecorder.start(1200); // ~1.2s chunks
-  tickLevel();
 }
 
-function stopSession() {
+function stopSession(keepStatus = false) {
+  const wasRunning = isRunning;
   isRunning = false;
+  starting = false;
   try {
     if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
   } catch (_) {}
   mediaRecorder = null;
+  if (micSource) { try { micSource.disconnect(); } catch (_) {} micSource = null; }
+  micAnalyser = null;
   if (mediaStream) {
     mediaStream.getTracks().forEach((t) => t.stop());
     mediaStream = null;
   }
-  $("startBtn").disabled = false;
-  $("stopBtn").disabled = true;
-  $("levelBar").style.width = "0%";
-  if ($("statusText").textContent.startsWith("Live") || $("statusText").textContent.startsWith("Listening")) {
-    setStatus("Stopped");
-  }
+  clearInterval(elapsedTimer);
+  setLiveButton("false");
+  if (wasRunning && !keepStatus) setStatus("Stopped", "stopped");
 }
 
 function arrayBufferToBase64(buffer) {
@@ -314,23 +728,35 @@ function pumpAudio() {
   });
 }
 
-$("startBtn").addEventListener("click", () => startSession().catch((e) => setStatus(e.message)));
-$("stopBtn").addEventListener("click", stopSession);
+$("liveBtn").addEventListener("click", () => {
+  if (isRunning) stopSession();
+  else startSession().catch((e) => { setLiveButton("false"); toast(e.message, "error"); });
+});
 
-// Boot
+/* ============================================================
+   Boot
+   ============================================================ */
+async function enterApp() {
+  setBalance(currentUser.balanceSeconds);
+  setStatus("Ready", "idle");
+  showApp();
+  await loadVoices();
+}
+
 (async function init() {
-  const settings = await window.speich.getSettings();
-  $("apiBaseInput").value = settings.apiBaseUrl || "http://localhost:3850";
   if (token) {
     try {
       const data = await api("/api/me");
       currentUser = data.user;
-      await enterApp();
+      setBalance(currentUser.balanceSeconds);
+      setStatus("Ready", "idle");
+      showApp(false);
+      await loadVoices();
       return;
     } catch (_) {
       token = null;
       localStorage.removeItem("speich_token");
     }
   }
-  showAuth();
+  showAuth(false);
 })();
