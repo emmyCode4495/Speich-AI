@@ -17,6 +17,7 @@ let starting = false;
 let selectedVoiceId = null;
 let voices = [];
 let audioQueue = [];
+let selectedOutputId = localStorage.getItem("speich_output_id") || "";
 let playing = false;
 
 // audio graph
@@ -359,6 +360,7 @@ $("logoutBtn").addEventListener("click", () => {
   localStorage.removeItem("speich_token");
   $("authPassword").value = "";
   showAuth();
+  refreshOutputDevices();
 });
 
 $("refreshBalBtn").addEventListener("click", async () => {
@@ -692,55 +694,47 @@ async function startSession() {
     return;
   }
 
-  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-    ? "audio/webm;codecs=opus"
-    : "audio/webm";
-  mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 64000 });
+  // Capture PCM and encode complete WAV files.
+  // MediaRecorder timeslice WebM chunks are incomplete and ElevenLabs rejects them as "corrupted".
+  const CHUNK_MS = 1500;
+  const sampleRate = ac.sampleRate || 48000;
+  const bufferSize = 4096;
+  const pcmChunks = [];
+  let samplesBuffered = 0;
+  const samplesPerChunk = Math.floor(sampleRate * (CHUNK_MS / 1000));
 
-  mediaRecorder.ondataavailable = async (ev) => {
-    if (!ev.data || ev.data.size < 500 || !isRunning) return;
-    const blob = ev.data;
-    // ~chunk duration estimate from timeslice
-    const durationSeconds = 1.2;
-    const sentAt = performance.now();
-    inflight++;
-    try {
-      const ab = await blob.arrayBuffer();
-      const b64 = arrayBufferToBase64(ab);
-      const result = await api("/api/sts/convert", {
-        method: "POST",
-        body: JSON.stringify({
-          voiceId: selectedVoiceId,
-          audioBase64: b64,
-          contentType: mime.split(";")[0],
-          durationSeconds,
-          filename: "chunk.webm"
-        })
-      });
-      $("latency").textContent = `${((performance.now() - sentAt) / 1000).toFixed(1)}s`;
-      setBalance(result.balanceSeconds);
-      if (result.balanceSeconds < 1) {
-        setStatus("Stopped, balance empty", "stopped");
-        toast("Your balance ran out. Add minutes to continue.", "error");
-        stopSession(true);
-        return;
+  const processor = ac.createScriptProcessor(bufferSize, 1, 1);
+  micSource.connect(processor);
+  processor.connect(ac.createGain()); // keep graph alive; gain 0 via destination optional
+  const silent = ac.createGain();
+  silent.gain.value = 0;
+  processor.connect(silent);
+  silent.connect(ac.destination);
+
+  processor.onaudioprocess = (e) => {
+    if (!isRunning) return;
+    const input = e.inputBuffer.getChannelData(0);
+    pcmChunks.push(new Float32Array(input));
+    samplesBuffered += input.length;
+    if (samplesBuffered >= samplesPerChunk) {
+      const merged = mergeFloat32(pcmChunks);
+      pcmChunks.length = 0;
+      samplesBuffered = 0;
+      // take exactly one chunk worth; keep remainder
+      const take = merged.subarray(0, samplesPerChunk);
+      const rest = merged.subarray(samplesPerChunk);
+      if (rest.length) {
+        pcmChunks.push(rest);
+        samplesBuffered = rest.length;
       }
-      enqueuePlayback(result.audioBase64, result.contentType || "audio/mpeg");
-      setStatus("Live, converting", "converting");
-    } catch (err) {
-      if (err.status === 402) {
-        setStatus("Stopped, balance empty", "stopped");
-        toast("Your balance ran out. Add minutes to continue.", "error");
-        stopSession(true);
-      } else {
-        console.error(err);
-        setStatus("Conversion error", "error");
-        toast(err.message || "Conversion failed", "error");
-      }
-    } finally {
-      inflight = Math.max(0, inflight - 1);
+      void sendPcmChunk(take, sampleRate);
     }
   };
+
+  mediaRecorder = { processor, stop() {
+    try { processor.disconnect(); } catch (_) {}
+    processor.onaudioprocess = null;
+  }};
 
   isRunning = true;
   starting = false;
@@ -753,7 +747,100 @@ async function startSession() {
   elapsedTimer = setInterval(() => {
     $("elapsed").textContent = fmtClock((performance.now() - sessionStart) / 1000);
   }, 250);
-  mediaRecorder.start(1200); // ~1.2s chunks
+}
+
+function mergeFloat32(arrays) {
+  let total = 0;
+  for (const a of arrays) total += a.length;
+  const out = new Float32Array(total);
+  let off = 0;
+  for (const a of arrays) {
+    out.set(a, off);
+    off += a.length;
+  }
+  return out;
+}
+
+function encodeWavMono(float32, sampleRate) {
+  const numSamples = float32.length;
+  const bytesPerSample = 2;
+  const blockAlign = bytesPerSample;
+  const buffer = new ArrayBuffer(44 + numSamples * bytesPerSample);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + numSamples * bytesPerSample, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, numSamples * bytesPerSample, true);
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return buffer;
+}
+
+async function sendPcmChunk(float32, sampleRate) {
+  if (!isRunning || !selectedVoiceId) return;
+  // skip near-silence to save credits
+  let peak = 0;
+  for (let i = 0; i < float32.length; i += 8) {
+    const v = Math.abs(float32[i]);
+    if (v > peak) peak = v;
+  }
+  if (peak < 0.01) return;
+
+  const wav = encodeWavMono(float32, sampleRate);
+  const durationSeconds = float32.length / sampleRate;
+  const sentAt = performance.now();
+  inflight++;
+  try {
+    const b64 = arrayBufferToBase64(wav);
+    const result = await api("/api/sts/convert", {
+      method: "POST",
+      body: JSON.stringify({
+        voiceId: selectedVoiceId,
+        audioBase64: b64,
+        contentType: "audio/wav",
+        durationSeconds,
+        filename: "chunk.wav"
+      })
+    });
+    $("latency").textContent = `${((performance.now() - sentAt) / 1000).toFixed(1)}s`;
+    setBalance(result.balanceSeconds);
+    if (result.balanceSeconds < 1) {
+      setStatus("Stopped, balance empty", "stopped");
+      toast("Your balance ran out. Add minutes to continue.", "error");
+      stopSession(true);
+      return;
+    }
+    enqueuePlayback(result.audioBase64, result.contentType || "audio/mpeg");
+    setStatus("Live, converting", "converting");
+  } catch (err) {
+    if (err.status === 402) {
+      setStatus("Stopped, balance empty", "stopped");
+      toast("Your balance ran out. Add minutes to continue.", "error");
+      stopSession(true);
+    } else {
+      console.error(err);
+      setStatus("Conversion error", "error");
+      toast(err.message || "Conversion failed", "error");
+    }
+  } finally {
+    inflight = Math.max(0, inflight - 1);
+  }
 }
 
 function stopSession(keepStatus = false) {
@@ -761,7 +848,10 @@ function stopSession(keepStatus = false) {
   isRunning = false;
   starting = false;
   try {
-    if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    if (mediaRecorder) {
+      if (typeof mediaRecorder.stop === "function") mediaRecorder.stop();
+      else if (mediaRecorder.state && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    }
   } catch (_) {}
   mediaRecorder = null;
   if (micSource) { try { micSource.disconnect(); } catch (_) {} micSource = null; }
@@ -785,6 +875,40 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
+
+async function refreshOutputDevices() {
+  const sel = $("outputDeviceSelect");
+  if (!sel) return;
+  try {
+    // Permission helps labels show on some OS
+    const tmp = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
+    if (tmp) tmp.getTracks().forEach((t) => t.stop());
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outputs = devices.filter((d) => d.kind === "audiooutput");
+    const prev = selectedOutputId || sel.value;
+    sel.innerHTML = `<option value="">Default speakers</option>` +
+      outputs.map((d) => {
+        const label = d.label || `Output ${d.deviceId.slice(0, 8)}`;
+        return `<option value="${d.deviceId}">${label.replace(/</g, "&lt;")}</option>`;
+      }).join("");
+    if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+    selectedOutputId = sel.value || "";
+  } catch (e) {
+    console.warn("enumerateDevices", e);
+  }
+}
+
+async function applyOutputDevice(el) {
+  if (!el || typeof el.setSinkId !== "function") return;
+  const id = selectedOutputId || "";
+  try {
+    await el.setSinkId(id);
+  } catch (e) {
+    console.warn("setSinkId failed", e);
+    toast?.("Could not switch output device. Use Default speakers or reinstall virtual cable.", "error");
+  }
+}
+
 function enqueuePlayback(b64, contentType) {
   const byteChars = atob(b64);
   const bytes = new Uint8Array(byteChars.length);
@@ -806,12 +930,27 @@ function pumpAudio() {
     playing = false;
     pumpAudio();
   };
-  el.play().catch((e) => {
-    console.warn("play failed", e);
-    playing = false;
-    pumpAudio();
+  applyOutputDevice(el).then(() => {
+    el.play().catch((e) => {
+      console.warn("play failed", e);
+      playing = false;
+      pumpAudio();
+    });
   });
 }
+
+
+$("outputDeviceSelect")?.addEventListener("change", async (e) => {
+  selectedOutputId = e.target.value || "";
+  localStorage.setItem("speich_output_id", selectedOutputId);
+  await applyOutputDevice($("playback"));
+  const name = e.target.selectedOptions?.[0]?.text || "Default";
+  toast?.(`Output → ${name}`, "ok");
+});
+
+navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+  refreshOutputDevices();
+});
 
 $("liveBtn").addEventListener("click", () => {
   if (isRunning) stopSession();
@@ -826,6 +965,7 @@ async function enterApp() {
   setStatus("Ready", "idle");
   showApp();
   await loadVoices();
+  await refreshOutputDevices();
 }
 
 (async function init() {

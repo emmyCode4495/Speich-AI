@@ -134,7 +134,7 @@
           <li class="link-seg" aria-hidden="true"></li>
           <li class="node" id="nodeConv"><i></i><span>Conversion</span></li>
           <li class="link-seg" aria-hidden="true"></li>
-          <li class="node" id="nodeOut"><i></i><span>Speakers</span></li>
+          <li class="node" id="nodeOut"><i></i><span>Output</span></li>
         </ul>
 
         <div class="controls">
@@ -175,12 +175,24 @@
   <!-- ============ Shared ============ -->
   <dialog id="settingsDialog" aria-labelledby="settingsTitle">
     <form id="settingsForm">
-      <h3 id="settingsTitle">Server settings</h3>
+      <h3 id="settingsTitle">Settings</h3>
       <div class="field">
         <label for="apiBaseInput">API address</label>
         <input id="apiBaseInput" type="url" placeholder="http://localhost:3850" />
       </div>
-      <p class="hint">The address of your Speich AI server. Change this if you deployed it online.</p>
+      <p class="hint">Speich server URL (local or Render). Not Morphly.</p>
+      <div class="field">
+        <label for="outputDeviceSelect">Output device (for Discord / Zoom / OBS)</label>
+        <select id="outputDeviceSelect">
+          <option value="">Default speakers</option>
+        </select>
+      </div>
+      <p class="hint">
+        Speich cannot appear as a microphone by itself. Install a virtual cable, set
+        <strong>Output</strong> here to that cable’s <em>playback</em> device, then in Discord/Zoom
+        choose the cable as your <em>microphone</em>.
+        Windows: VB-Audio Cable · Mac: BlackHole 2ch.
+      </p>
       <div class="dialog-actions">
         <button type="button" class="btn ghost" id="cancelApiBtn">Cancel</button>
         <button type="submit" class="btn primary" id="saveApiBtn">Save</button>
