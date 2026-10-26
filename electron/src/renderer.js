@@ -351,6 +351,7 @@ $("authForm").addEventListener("submit", async (e) => {
 });
 
 $("logoutBtn").addEventListener("click", () => {
+  stopPreview();
   stopSession();
   token = null;
   currentUser = null;
@@ -411,16 +412,27 @@ function voiceSub(v) {
   return bits.length ? bits.join(", ") : v.category || "";
 }
 
+const PLAY_SVG = `<svg viewBox="0 0 34 34" aria-hidden="true">
+  <circle class="ring-bg" cx="17" cy="17" r="14.5"/>
+  <circle class="ring" cx="17" cy="17" r="14.5" transform="rotate(-90 17 17)"/>
+  <path class="i-play" d="M14 11.5v11l9-5.5z"/>
+  <g class="i-pause"><rect x="12.5" y="11.5" width="3.2" height="11" rx="1.1"/><rect x="18.3" y="11.5" width="3.2" height="11" rx="1.1"/></g>
+</svg>`;
+
 function renderVoices() {
+  stopPreview();
   const box = $("voiceItems");
   box.textContent = "";
   voices.forEach((v) => {
+    const wrap = document.createElement("div");
+    wrap.className = "voice-row";
+    wrap.dataset.name = (v.name || "").toLowerCase();
+
     const row = document.createElement("button");
     row.type = "button";
     row.className = "voice";
     row.setAttribute("role", "radio");
     row.dataset.id = v.voiceId;
-    row.dataset.name = (v.name || "").toLowerCase();
     row.style.setProperty("--h", hueFor(v.name || v.voiceId));
 
     const mono = document.createElement("span");
@@ -439,7 +451,22 @@ function renderVoices() {
 
     row.append(mono, text);
     row.addEventListener("click", () => selectVoice(v.voiceId, { focus: false }));
-    box.appendChild(row);
+    wrap.appendChild(row);
+
+    // preview button sits beside the voice, never inside the radio button
+    if (v.previewUrl) {
+      wrap.classList.add("has-preview");
+      const pb = document.createElement("button");
+      pb.type = "button";
+      pb.className = "play";
+      pb.dataset.state = "idle";
+      pb.dataset.name = v.name || "voice";
+      pb.setAttribute("aria-label", `Play preview of ${v.name || "voice"}`);
+      pb.innerHTML = PLAY_SVG;
+      pb.addEventListener("click", () => togglePreview(v, pb));
+      wrap.appendChild(pb);
+    }
+    box.appendChild(wrap);
   });
 
   $("voiceCount").textContent = voices.length ? String(voices.length) : "";
@@ -450,6 +477,59 @@ function renderVoices() {
   empty.textContent = "No voices match that search.";
   box.appendChild(empty);
   selectVoice(selectedVoiceId, { instant: true });
+}
+
+/* ---------- Voice preview ---------- */
+let preview = null; // { id, audio, btn }
+
+function setPreviewState(btn, state) {
+  btn.dataset.state = state;
+  btn.setAttribute("aria-label", `${state === "idle" ? "Play" : "Stop"} preview of ${btn.dataset.name}`);
+  if (state !== "playing") btn.style.setProperty("--p", "0");
+}
+
+function stopPreview() {
+  if (!preview) return;
+  const { audio, btn } = preview;
+  preview = null; // clear first so the audio's own events are ignored
+  audio.pause();
+  audio.removeAttribute("src");
+  audio.load();
+  setPreviewState(btn, "idle");
+}
+
+function previewFailed(cur) {
+  if (preview !== cur) return;
+  setPreviewState(cur.btn, "idle");
+  preview = null;
+  toast("Couldn't play this preview. Check your connection and try again.", "error");
+}
+
+function togglePreview(v, btn) {
+  if (isRunning || starting) {
+    toast("Stop your session to preview voices");
+    return;
+  }
+  if (preview && preview.id === v.voiceId) { stopPreview(); return; }
+  stopPreview();
+
+  const audio = new Audio();
+  const cur = { id: v.voiceId, audio, btn };
+  preview = cur;
+  setPreviewState(btn, "loading");
+
+  audio.addEventListener("playing", () => { if (preview === cur) setPreviewState(btn, "playing"); });
+  audio.addEventListener("timeupdate", () => {
+    if (preview === cur && audio.duration) btn.style.setProperty("--p", (audio.currentTime / audio.duration).toFixed(3));
+  });
+  audio.addEventListener("ended", () => {
+    if (preview !== cur) return;
+    btn.style.setProperty("--p", "1");
+    setTimeout(() => { if (preview === cur) { setPreviewState(btn, "idle"); preview = null; } }, 180);
+  });
+  audio.addEventListener("error", () => previewFailed(cur));
+  audio.src = v.previewUrl;
+  audio.play().catch((err) => { if (err.name !== "AbortError") previewFailed(cur); });
 }
 
 function selectVoice(id, { instant = false, focus = false } = {}) {
@@ -474,7 +554,8 @@ function selectVoice(id, { instant = false, focus = false } = {}) {
 
 function placeHighlight(instant) {
   const hi = $("voiceHi");
-  const row = document.querySelector(`#voiceItems .voice[aria-checked="true"]`);
+  const radio = document.querySelector(`#voiceItems .voice[aria-checked="true"]`);
+  const row = radio && radio.parentElement;
   if (!row || row.classList.contains("hide")) { hi.classList.remove("show"); return; }
   hi.style.height = `${row.offsetHeight}px`;
   if (instant || !hi.classList.contains("show")) hi.classList.remove("ready");
@@ -486,7 +567,8 @@ function placeHighlight(instant) {
 
 $("voiceList").addEventListener("keydown", (e) => {
   if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
-  const rows = [...document.querySelectorAll("#voiceItems .voice:not(.hide)")];
+  if (!e.target.closest(".voice")) return; // leave the play buttons alone
+  const rows = [...document.querySelectorAll("#voiceItems .voice-row:not(.hide) .voice")];
   if (!rows.length) return;
   e.preventDefault();
   let i = rows.findIndex((r) => r.dataset.id === selectedVoiceId);
@@ -499,7 +581,7 @@ $("voiceList").addEventListener("keydown", (e) => {
 $("voiceSearch").addEventListener("input", (e) => {
   const q = e.target.value.trim().toLowerCase();
   let shown = 0;
-  document.querySelectorAll("#voiceItems .voice").forEach((r) => {
+  document.querySelectorAll("#voiceItems .voice-row").forEach((r) => {
     const hit = !q || r.dataset.name.includes(q);
     r.classList.toggle("hide", !hit);
     if (hit) shown++;
@@ -511,6 +593,7 @@ $("voiceSearch").addEventListener("input", (e) => {
 window.addEventListener("resize", () => placeHighlight(true));
 
 async function loadVoices() {
+  stopPreview();
   const box = $("voiceItems");
   box.innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div>';
   $("voiceHi").classList.remove("show");
@@ -560,6 +643,7 @@ function setLiveButton(state) {
   $("liveBtn").dataset.live = state; // "false" | "busy" | "true"
   $("liveBtn").disabled = state === "busy";
   $("appScreen").querySelector(".stage").classList.toggle("live", state === "true");
+  $("appScreen").classList.toggle("session-live", state !== "false");
 }
 
 function micErrorMessage(err) {
@@ -579,6 +663,7 @@ async function startSession() {
     return;
   }
 
+  stopPreview();
   starting = true;
   setLiveButton("busy");
   setStatus("Connecting…", "connecting");

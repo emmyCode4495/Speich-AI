@@ -343,6 +343,7 @@ input:focus { outline: none; border-color: var(--voice); box-shadow: 0 0 0 3px r
   transition: background .18s;
 }
 .voice:hover { background: rgba(255, 255, 255, .04); }
+.voice-row.has-preview .voice { padding-right: 58px; }
 .voice:active .mono { transform: scale(.92); }
 .mono {
   flex: none; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 50%;
@@ -355,7 +356,8 @@ input:focus { outline: none; border-color: var(--voice); box-shadow: 0 0 0 3px r
 .v-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .v-sub { font-size: 12px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-transform: capitalize; }
 .voice[aria-checked="true"] .v-sub { color: var(--muted); }
-.voice.hide { display: none; }
+.voice-row { position: relative; }
+.voice-row.hide { display: none; }
 
 .voice-empty { padding: 24px 12px; color: var(--faint); text-align: center; }
 
@@ -396,7 +398,7 @@ dialog h3 { font-family: var(--display); font-size: 1.3rem; font-weight: 600; ma
 
 .app:not(.hidden) .stage  { animation: rise .55s var(--ease) both; }
 .app:not(.hidden) .voices { animation: rise .55s var(--ease) .08s both; }
-.app:not(.hidden) .voice  { animation: fade .4s var(--ease) .2s both; }
+.app:not(.hidden) .voice-row { animation: fade .4s var(--ease) .2s both; }
 
 /* ---------- Keyframes ---------- */
 @keyframes spin    { to { transform: rotate(360deg); } }
@@ -441,3 +443,34 @@ dialog h3 { font-family: var(--display); font-size: 1.3rem; font-weight: 600; ma
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
   .live-btn[data-live="true"]::after { display: none; }
 }
+
+/* ---------- Voice preview button ---------- */
+.play {
+  position: absolute; right: 10px; top: 50%; width: 34px; height: 34px; margin-top: -17px; padding: 0;
+  display: grid; place-items: center; border: 0; border-radius: 50%;
+  background: transparent; color: var(--voice);
+  transition: background .18s var(--ease), transform .18s var(--ease-spring), opacity .2s;
+}
+.play:hover { background: rgba(167, 155, 255, .16); transform: scale(1.08); }
+.play:active { transform: scale(.92); }
+.play svg { width: 34px; height: 34px; overflow: visible; }
+.play .ring-bg { fill: none; stroke: var(--line); stroke-width: 1.6; transition: stroke .2s; }
+.play:hover .ring-bg { stroke: rgba(167, 155, 255, .5); }
+.play .ring {
+  fill: none; stroke: var(--voice); stroke-width: 2.2; stroke-linecap: round;
+  stroke-dasharray: 91.1; stroke-dashoffset: calc(91.1 * (1 - var(--p, 0)));
+  opacity: 0; transition: stroke-dashoffset .3s linear, opacity .2s;
+}
+.play .i-play  { fill: currentColor; transform-origin: 17px 17px; transition: opacity .15s, transform .3s var(--ease-spring); }
+.play .i-pause { fill: currentColor; opacity: 0; transform-origin: 17px 17px; transform: scale(.5); transition: opacity .15s, transform .3s var(--ease-spring); }
+
+.play[data-state="loading"] svg { animation: spin .8s linear infinite; }
+.play[data-state="loading"] .ring { opacity: 1; stroke-dasharray: 22 70; stroke-dashoffset: 0; transition: none; }
+.play[data-state="loading"] .i-play { opacity: 0; transform: scale(.5); }
+
+.play[data-state="playing"] { background: rgba(167, 155, 255, .14); }
+.play[data-state="playing"] .ring { opacity: 1; }
+.play[data-state="playing"] .i-play  { opacity: 0; transform: scale(.5); }
+.play[data-state="playing"] .i-pause { opacity: 1; transform: none; }
+
+.session-live .play { opacity: .35; }
